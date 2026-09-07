@@ -22,3 +22,15 @@ patches
 install.sh
 env.reference
 test_seed_determinism.sh
+tts.py
+docker-compose.yml
+README.md
+LICENSE
+env.example
+.gitignore
+.git
+
+# Downloaded weights and generated audio, bind-mounted at runtime, never baked in.
+cache
+*.wav
+*.flac
