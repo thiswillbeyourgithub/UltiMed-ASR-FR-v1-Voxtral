@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+
+# Model weights and HF cache, mounted into the container at /cache (~9GB).
+cache/
+
+# Generated audio.
+*.wav
+*.flac
+*.mp3
+*.opus
+
+# Sandbox / agent scratch files.
+.claude/
+.serena/
+.tokensave/
+.aider*
+
+# Local vllm-omni clone that the Dockerfile builds the TTS image from (branch
+# `perso` carries the per-request cfg_alpha / seed / euler_steps patches).
+# Untracked on purpose: it is a full upstream tree with its own git history, so
+# vendoring it here would bury this repository's own diffs. Recreate it from
+# patches/, see patches/README.md.
+vllm-omni/

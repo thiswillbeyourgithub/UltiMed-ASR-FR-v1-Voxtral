@@ -1,0 +1,385 @@
+From 7bdd136f1cbecc4e6d7d74ec4816bea3ee498196 Mon Sep 17 00:00:00 2001
+From: thiswillbeyourgithub
+ <26625900+thiswillbeyourgithub@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 20:11:06 +0200
+Subject: [PATCH 2/4] voxtral tts: per-request noise seed and euler steps in
+ the acoustic decoder
+
+The Gaussian each 12.5 Hz frame's flow-matching ODE starts from is the only
+source of randomness in Voxtral's output (the semantic head is an argmax, the
+acoustic head is deterministic flow matching, stage 0's sampling params are
+inert). Upstream draws it from the global torch RNG with no generator, so a
+take is reproducible only as "request N after a fresh boot with requests
+1..N-1 identical", and reproducing one specific request means a restart.
+
+Draw it in make_omni_output instead, per request, from a torch.Generator
+seeded with SplitMix64(seed, frame index). The frame counter lives in the
+request's own extra_args dict, which the model runner hands over by reference,
+so frame N depends only on (seed, N). Unlike re-pinning the global RNG this
+survives concurrency: each row gets its own stream instead of a share of one
+sequence whose split depends on batch composition. With no seeded request in
+the batch, nothing is drawn here and behaviour is bit-for-bit upstream.
+
+euler_steps rides the same route into _extract_euler_steps. It is a loop
+bound, not a per-row tensor like cfg_alpha, so it is honoured only when every
+request in the decode step agrees (warning once otherwise) and it forces the
+eager path, since the CUDA graphs bake one fixed step count into their capture.
+
+noise and n_steps are threaded through compute_mm_logits, forward and
+decode_one_frame as optional args defaulting to None, so every existing call
+site keeps upstream behaviour.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ ...cuda_graph_acoustic_transformer_wrapper.py |  28 ++-
+ .../models/voxtral_tts/voxtral_tts.py         | 180 +++++++++++++++++-
+ .../voxtral_tts_audio_generation.py           |  36 +++-
+ 3 files changed, 237 insertions(+), 7 deletions(-)
+
+diff --git a/vllm_omni/model_executor/models/voxtral_tts/cuda_graph_acoustic_transformer_wrapper.py b/vllm_omni/model_executor/models/voxtral_tts/cuda_graph_acoustic_transformer_wrapper.py
+index 491f185..72601af 100644
+--- a/vllm_omni/model_executor/models/voxtral_tts/cuda_graph_acoustic_transformer_wrapper.py
++++ b/vllm_omni/model_executor/models/voxtral_tts/cuda_graph_acoustic_transformer_wrapper.py
+@@ -226,6 +226,8 @@ class CUDAGraphAcousticTransformerWrapper:
+         self,
+         hidden_states: torch.Tensor,
+         cfg_alpha: torch.Tensor,
++        noise: torch.Tensor | None = None,
++        n_steps: int | None = None,
+     ) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]] | None]:
+         """
+         Drop-in replacement for model.compute_mm_logits().
+@@ -233,15 +235,30 @@ class CUDAGraphAcousticTransformerWrapper:
+         Falls back to eager execution if:
+         - CUDA graph is not enabled/warmed up
+         - Batch size exceeds largest captured size
++        - A request asked for a step count other than the captured one (local fork)
++
++        Local fork parameters
++        ---------------------
++        noise : torch.Tensor | None
++            (B, n_acoustic_codebook) start noise for the flow-matching ODE. None
++            keeps the upstream behaviour of drawing fresh noise from the global
++            RNG; a tensor makes the take reproducible for the requests that asked
++            for a seed.
++        n_steps : int | None
++            Per-request Euler step count. The graphs bake one fixed count into
++            their captured loop, so a different value has to run eagerly.
+         """
+         actual_size = hidden_states.shape[0]
+ 
++        if n_steps is not None and n_steps != self.n_steps:
++            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, noise=noise, n_steps=n_steps)
++
+         if not self.enabled or not self._warmed_up:
+-            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
++            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, noise=noise)
+ 
+         padded_size = self._get_padded_size(actual_size)
+         if padded_size is None or padded_size not in self.graphs:
+-            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha)
++            return self.model.compute_mm_logits(hidden_states, cfg_alpha=cfg_alpha, noise=noise)
+ 
+         # Zero static input, then copy actual data
+         self.static_inputs[padded_size].zero_()
+@@ -252,8 +269,13 @@ class CUDAGraphAcousticTransformerWrapper:
+         self.static_cfg_alpha[padded_size][:actual_size, 0] = cfg_alpha
+ 
+         # Fill noise buffer with fresh random values before replay so the
+-        # flow-matching ODE starts from different initial noise each time.
++        # flow-matching ODE starts from different initial noise each time. The
++        # padding rows beyond actual_size are always freshly drawn: their output is
++        # discarded, and leaving them stale would make one request's audio depend
++        # on the padded tail of an earlier batch.
+         self.static_noise[padded_size].normal_()
++        if noise is not None:
++            self.static_noise[padded_size][:actual_size] = noise.to(dtype=self.static_noise[padded_size].dtype)
+ 
+         # Replay captured graph
+         self.graphs[padded_size].replay()
+diff --git a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
+index eb8b5c1..54c6b0a 100644
+--- a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
++++ b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts.py
+@@ -296,6 +296,176 @@ class VoxtralTTSForConditionalGeneration(
+ 
+     _DEFAULT_CFG_ALPHA = 1.2
+ 
++    # --- Per-request knobs carried in SamplingParams.extra_args (local fork) ----
++    # Both keys are written by
++    # entrypoints/openai/serving_speech.py::_apply_voxtral_request_overrides, from
++    # the request's flat `seed` / `euler_steps` fields (or verbatim from
++    # `extra_params`). They arrive here through the model runner, which passes the
++    # per-request extra_args dicts as `sampling_extra_args`, in input_batch.req_ids
++    # order, the same list `_extract_cfg_alpha` already reads.
++    _NOISE_SEED_KEY = "voxtral_noise_seed"
++    _EULER_STEPS_KEY = "voxtral_euler_steps"
++    # Server-side frame counter (leading underscore: not a client field), stored
++    # beside the request's own seed. This works because the runner hands over the
++    # request's ACTUAL extra_args dict (worker/gpu_model_runner.py::
++    # _build_model_kwargs_extra), so a value written on one decode step is still
++    # there on the next step of the same request. It is what makes frame N of a
++    # take depend on (seed, N) instead of on how much audio the process generated
++    # before it.
++    _NOISE_STEP_KEY = "_voxtral_noise_step"
++    _MASK64 = (1 << 64) - 1
++    # One-shot warning latches; instances override these when they fire.
++    _warned_mixed_euler_steps = False
++    _warned_noise_batch_mismatch = False
++
++    @classmethod
++    def _mix64(cls, state: int) -> int:
++        """SplitMix64 finalizer, used to fold (seed, frame) into a stream seed.
++
++        Python's built-in ``hash()`` cannot be used for this: it is salted per
++        process, so the same request seed would give different audio on every boot
++        and in every worker.
++
++        Parameters
++        ----------
++        state : int
++            Arbitrary 64-bit input.
++
++        Returns
++        -------
++        int
++            Well-mixed 64-bit output.
++        """
++        state = (state + 0x9E3779B97F4A7C15) & cls._MASK64
++        state = ((state ^ (state >> 30)) * 0xBF58476D1CE4E5B9) & cls._MASK64
++        state = ((state ^ (state >> 27)) * 0x94D049BB133111EB) & cls._MASK64
++        return state ^ (state >> 31)
++
++    def _make_frame_noise(
++        self, input_hidden_states: torch.Tensor, sampling_extra_args: list[dict] | None
++    ) -> torch.Tensor | None:
++        """Build this frame's flow-matching start noise, seeded per request.
++
++        The Gaussian that each 12.5 Hz frame's Euler ODE starts from is the ONLY
++        source of randomness in Voxtral's output: the semantic head is an argmax,
++        the acoustic head is deterministic flow matching, and stage 0's sampling
++        params are inert (it feeds vLLM's sampler fake logits). Upstream draws that
++        Gaussian from the global torch RNG with no generator argument, in
++        ``AcousticTransformer.decode_one_frame`` or ``static_noise.normal_()``, so a
++        take is only reproducible as "request N after a fresh boot, with requests
++        1..N-1 identical", and reproducing one specific request means restarting the
++        server.
++
++        Drawing it here instead, from a per-request ``torch.Generator``, makes a take
++        a pure function of (its seed, its frame index). It holds under concurrency,
++        which a global-RNG approach cannot do: each row gets its own stream rather
++        than a share of one sequence whose split depends on batch composition.
++
++        Requests without a seed keep upstream behaviour exactly: with no seed
++        anywhere in the batch this returns None and the callee draws its own noise.
++
++        Parameters
++        ----------
++        input_hidden_states : torch.Tensor
++            (B, D) stage-0 hidden states for this decode step; supplies B, device
++            and dtype.
++        sampling_extra_args : list[dict] | None
++            Per-request extra_args dicts in batch order, or None when the deploy
++            config left stage 0's default extra_args empty (which switches off
++            has_sampling_extra_args, and with it cfg_alpha too).
++
++        Returns
++        -------
++        torch.Tensor | None
++            (B, n_acoustic_codebook) noise, or None when no request asked for a
++            seed.
++        """
++        if not sampling_extra_args:
++            return None
++        seeds = [row.get(self._NOISE_SEED_KEY) if isinstance(row, dict) else None for row in sampling_extra_args]
++        if all(seed is None for seed in seeds):
++            return None
++
++        batch_size = input_hidden_states.shape[0]
++        if len(seeds) != batch_size:
++            # Rows and hidden-state rows must line up or a seed would be applied to
++            # the wrong request. Bail out rather than mis-seed (and rather than
++            # crash a running server).
++            if not self._warned_noise_batch_mismatch:
++                self._warned_noise_batch_mismatch = True
++                logger.warning(
++                    "voxtral_tts: %d sampling_extra_args rows for a batch of %d; per-request noise seeding "
++                    "skipped for this step",
++                    len(seeds),
++                    batch_size,
++                )
++            return None
++
++        n_codebooks = self.model.acoustic_transformer.model_args.n_acoustic_codebook
++        # Unseeded rows keep drawing from the global RNG exactly as upstream does.
++        noise = torch.randn(
++            batch_size,
++            n_codebooks,
++            device=input_hidden_states.device,
++            dtype=input_hidden_states.dtype,
++        )
++        for index, (row, seed) in enumerate(zip(sampling_extra_args, seeds)):
++            if seed is None:
++                continue
++            step = int(row.get(self._NOISE_STEP_KEY, 0))
++            row[self._NOISE_STEP_KEY] = step + 1
++            stream_seed = self._mix64(self._mix64(int(seed) & self._MASK64) ^ (step & self._MASK64))
++            # CPU generator: torch.Generator(device="cuda") would have to be built
++            # per frame (nothing safe to cache: extra_args crosses process
++            # boundaries), and a 36-float host-to-device copy at 12.5 Hz is free.
++            generator = torch.Generator()
++            generator.manual_seed(stream_seed)
++            noise[index] = torch.randn(n_codebooks, generator=generator, dtype=torch.float32).to(
++                device=input_hidden_states.device, dtype=input_hidden_states.dtype
++            )
++        return noise
++
++    def _extract_euler_steps(self, sampling_extra_args: list[dict] | None) -> int | None:
++        """Read a batch-uniform per-request Euler ODE step count, if any.
++
++        ``n_decoding_steps`` is a loop bound, not a per-row tensor like cfg_alpha,
++        so one decode step cannot honour two different values at once. When the
++        batch disagrees the model default wins and a warning is logged once: the
++        alternative (silently using one request's value for another's audio) would
++        be a reproducibility bug that only shows up under load.
++
++        Parameters
++        ----------
++        sampling_extra_args : list[dict] | None
++            Per-request extra_args dicts in batch order.
++
++        Returns
++        -------
++        int | None
++            The agreed step count, or None to keep the model's own default (which
++            also keeps the CUDA-graph fast path).
++        """
++        if not sampling_extra_args:
++            return None
++        requested = {
++            int(row[self._EULER_STEPS_KEY])
++            for row in sampling_extra_args
++            if isinstance(row, dict) and row.get(self._EULER_STEPS_KEY) is not None
++        }
++        if not requested:
++            return None
++        if len(requested) > 1:
++            if not self._warned_mixed_euler_steps:
++                self._warned_mixed_euler_steps = True
++                logger.warning(
++                    "voxtral_tts: requests in one decode step asked for different euler_steps %s; "
++                    "falling back to the model default for all of them. Send differing euler_steps "
++                    "sequentially, not concurrently.",
++                    sorted(requested),
++                )
++            return None
++        return requested.pop()
++
+     def _extract_cfg_alpha(self, input_hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+         """Extract per-request cfg_alpha from sampling_extra_args.
+ 
+@@ -327,13 +497,19 @@ class VoxtralTTSForConditionalGeneration(
+                 assert logits_index is not None
+                 input_hidden_states = hidden_states[logits_index]
+                 cfg_alpha = self._extract_cfg_alpha(input_hidden_states, **kwargs)
++                # Local fork: both are None unless a request asked for them, in
++                # which case the callee stops drawing its own noise / stops using
++                # its captured step count. See _make_frame_noise.
++                sampling_extra_args = kwargs.get("sampling_extra_args")
++                noise = self._make_frame_noise(input_hidden_states, sampling_extra_args)
++                n_steps = self._extract_euler_steps(sampling_extra_args)
+                 if self._cudagraph_acoustic_transformer is not None:
+                     fake_eos, multimodal_outputs = self._cudagraph_acoustic_transformer(
+-                        input_hidden_states, cfg_alpha=cfg_alpha
++                        input_hidden_states, cfg_alpha=cfg_alpha, noise=noise, n_steps=n_steps
+                     )
+                 else:
+                     fake_eos, multimodal_outputs = self.model.compute_mm_logits(
+-                        input_hidden_states, cfg_alpha=cfg_alpha
++                        input_hidden_states, cfg_alpha=cfg_alpha, noise=noise, n_steps=n_steps
+                     )
+                 hidden_states[logits_index, 0] = fake_eos
+                 return OmniOutput(
+diff --git a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_generation.py b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_generation.py
+index 2e50e34..58621ce 100644
+--- a/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_generation.py
++++ b/vllm_omni/model_executor/models/voxtral_tts/voxtral_tts_audio_generation.py
+@@ -517,17 +517,39 @@ class FlowMatchingAudioTransformer(nn.Module):
+         semantic_code: torch.Tensor,
+         llm_hidden: torch.Tensor,
+         cfg_alpha: torch.Tensor,
++        noise: torch.Tensor | None = None,
++        n_steps: int | None = None,
+     ) -> torch.Tensor:
++        """Run one frame's flow-matching ODE.
++
++        Local fork: `noise` and `n_steps` let the caller override what were
++        implicit globals. `noise` (B, n_acoustic_codebook) replaces the draw from
++        the global torch RNG, which is what makes a take reproducible per request
++        (see VoxtralTTSForConditionalGeneration._make_frame_noise); `n_steps`
++        replaces the count baked into `self._timesteps` at load time. Both default
++        to None, i.e. exactly the upstream behaviour.
++        """
+         B = semantic_code.shape[0]
+ 
+         # Skip decoding if codebook 0 is [END_AUDIO] token.
+         should_decode = semantic_code != self._end_audio_token_id
+ 
+         # acoustic_codes starts from x_0
+-        x_0 = torch.randn(B, self.model_args.n_acoustic_codebook).to(dtype=llm_hidden.dtype, device=llm_hidden.device)
++        if noise is None:
++            x_0 = torch.randn(B, self.model_args.n_acoustic_codebook).to(
++                dtype=llm_hidden.dtype, device=llm_hidden.device
++            )
++        else:
++            x_0 = noise.to(dtype=llm_hidden.dtype, device=llm_hidden.device)
+         x_0 = self._noise_scale * x_0
+ 
+-        timesteps = self._timesteps.to(dtype=llm_hidden.dtype)
++        if n_steps is None:
++            timesteps = self._timesteps.to(dtype=llm_hidden.dtype)
++        else:
++            # Rebuilt per frame on purpose: n_steps+1 scalars is nothing next to a
++            # transformer forward pass, and caching it would need invalidation
++            # keyed on a value that changes per request.
++            timesteps = torch.linspace(0, 1, n_steps + 1, device=llm_hidden.device, dtype=llm_hidden.dtype)
+         llm_hidden_zero = torch.zeros_like(llm_hidden)
+ 
+         # Reshape cfg_alpha for broadcasting: (B,) -> (B, 1)
+@@ -595,6 +617,8 @@ class FlowMatchingAudioTransformer(nn.Module):
+         self,
+         llm_hidden: torch.Tensor,
+         cfg_alpha: torch.Tensor,
++        noise: torch.Tensor | None = None,
++        n_steps: int | None = None,
+     ) -> torch.Tensor:
+         # llm_hidden: BxD
+         semantic_logit = self.semantic_codebook_output(llm_hidden).float()
+@@ -608,6 +632,8 @@ class FlowMatchingAudioTransformer(nn.Module):
+             semantic_code.squeeze(1),
+             llm_hidden,
+             cfg_alpha=cfg_alpha,
++            noise=noise,
++            n_steps=n_steps,
+         )
+ 
+         audio_codes = torch.concatenate(
+@@ -1068,12 +1094,18 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
+         self,
+         hidden_states: torch.Tensor,
+         cfg_alpha: torch.Tensor,
++        noise: torch.Tensor | None = None,
++        n_steps: int | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        # noise / n_steps: local fork, per-request overrides forwarded from
++        # VoxtralTTSForConditionalGeneration.make_omni_output. None = upstream.
+         audio_codes = None
+         mm_tokens = None
+         audio_codes = self.acoustic_transformer(
+             llm_hidden=hidden_states,
+             cfg_alpha=cfg_alpha,
++            noise=noise,
++            n_steps=n_steps,
+         )
+         fake_eos = torch.where(
+             audio_codes[:, 0] == AudioSpecialTokens.id(AudioSpecialTokens.end_audio),

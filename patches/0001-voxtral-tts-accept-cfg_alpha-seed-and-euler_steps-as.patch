@@ -1,0 +1,186 @@
+From bb5e10b8422918944893e6074d3883d1bfc3adad Mon Sep 17 00:00:00 2001
+From: thiswillbeyourgithub
+ <26625900+thiswillbeyourgithub@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 20:10:56 +0200
+Subject: [PATCH 1/4] voxtral tts: accept cfg_alpha, seed and euler_steps as
+ request fields
+
+OpenAICreateSpeechRequest has no model_config, so pydantic v2's default
+extra='ignore' drops any unknown flat key with a 200 response. A client
+sending {"cfg_alpha": 1.5} therefore looked like it worked while every
+request in fact ran at the server's startup default, and the only way to
+reach the knob was to nest it in extra_params. Same for the seed: the flat
+seed lands in SamplingParams.seed, which is arithmetically inert for Voxtral
+because stage 0 feeds vLLM's sampler a vocab-wide -inf row with one finite
+entry, so the winning token is forced regardless.
+
+Declare the three Voxtral levers as real fields (cfg_alpha, euler_steps,
+acoustic_temperature) and route them, plus the existing seed, in
+_apply_voxtral_request_overrides: the first three into stage 0's extra_args
+where the model reads them, acoustic_temperature into stage 1's sampling
+temperature. extra_params keeps working and still wins on conflict, so the
+low-level escape hatch stays trustworthy.
+
+The model-side readers for voxtral_noise_seed and voxtral_euler_steps come
+in the next commit; cfg_alpha already had one.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../entrypoints/openai/protocol/audio.py      | 40 +++++++++
+ .../entrypoints/openai/serving_speech.py      | 85 +++++++++++++++++++
+ 2 files changed, 125 insertions(+)
+
+diff --git a/vllm_omni/entrypoints/openai/protocol/audio.py b/vllm_omni/entrypoints/openai/protocol/audio.py
+index 9a85886..6e2de23 100644
+--- a/vllm_omni/entrypoints/openai/protocol/audio.py
++++ b/vllm_omni/entrypoints/openai/protocol/audio.py
+@@ -96,6 +96,46 @@ class OpenAICreateSpeechRequest(BaseModel):
+         ge=0,
+         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
+     )
++    # --- Voxtral TTS knobs (local fork) ---------------------------------------
++    # Upstream exposes these three only through `extra_params` (cfg_alpha) or not
++    # at all (euler_steps, acoustic_temperature). They are promoted to top-level
++    # fields here because this model is pydantic-permissive: it has no
++    # `model_config`, so pydantic v2's default extra='ignore' silently DROPS any
++    # unknown flat key with a 200 response, which makes a client that sends
++    # `{"cfg_alpha": 1.5}` look like it worked while every request in fact ran at
++    # the server's startup default. A declared field is the only way that mistake
++    # becomes visible. `extra_params` keeps working and still wins on conflict
++    # (see _apply_voxtral_request_overrides in serving_speech.py).
++    cfg_alpha: float | None = Field(
++        default=None,
++        gt=0.0,
++        description="Voxtral TTS classifier-free-guidance scale for the stage-0 "
++        "flow-matching acoustic transformer. Higher sticks more tightly to the "
++        "text at the cost of naturalness; 1.0 disables CFG and produces "
++        "phonetically plausible but off-text audio. Server default (deploy YAML "
++        "extra_args.cfg_alpha) applies when unset.",
++    )
++    euler_steps: int | None = Field(
++        default=None,
++        ge=1,
++        le=64,
++        description="Voxtral TTS Euler ODE / NFE step count for the stage-0 "
++        "flow-matching acoustic transformer (n_decoding_steps). More steps means "
++        "steadier audio for linearly more compute per frame. Applied only when "
++        "every request sharing a decode step asks for the same value, and it "
++        "forces the eager path because the CUDA graphs are captured at one fixed "
++        "step count. Model default (params.json, else 7) applies when unset.",
++    )
++    acoustic_temperature: float | None = Field(
++        default=None,
++        ge=0.0,
++        le=2.0,
++        description="Voxtral TTS sampling temperature for stage 1 (audio_tokenizer). "
++        "Exposed for parity with the server's startup knob; note stage 1 is a "
++        "deterministic codec decoder with no sampling path, so this is expected to "
++        "be a no-op and is not the lever for output variation (use seed / "
++        "cfg_alpha / euler_steps).",
++    )
+     extra_params: dict[str, Any] | None = Field(
+         default=None,
+         description=("Optional model-specific parameters passed directly to the model's extra_args."),
+diff --git a/vllm_omni/entrypoints/openai/serving_speech.py b/vllm_omni/entrypoints/openai/serving_speech.py
+index 57bed35..cadaf96 100644
+--- a/vllm_omni/entrypoints/openai/serving_speech.py
++++ b/vllm_omni/entrypoints/openai/serving_speech.py
+@@ -3044,6 +3044,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
+                     sampling_params_list[0].extra_args = {}
+                 sampling_params_list[0].extra_args["qwen3_tts_request_seed"] = request.seed
+ 
++        sampling_params_list = self._apply_voxtral_request_overrides(request, sampling_params_list)
++
+         generator = self.engine_client.generate(
+             prompt=prompt,
+             request_id=request_id,
+@@ -3053,6 +3055,89 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
+         self._track_ref_audio_artifact_warmup(request_id, qwen3_ref_audio_warmup_artifact_key)
+         return request_id, generator, tts_params
+ 
++    def _apply_voxtral_request_overrides(self, request, sampling_params_list):
++        """Route Voxtral TTS's flat request fields to where the model reads them.
++
++        Local fork. Three of Voxtral's levers have no upstream request route, so a
++        client can only reach them by restarting the server with a different deploy
++        YAML:
++
++        * ``cfg_alpha`` -> stage 0 ``extra_args["cfg_alpha"]``, read per request by
++          ``VoxtralTTSForConditionalGeneration._extract_cfg_alpha``.
++        * ``euler_steps`` -> stage 0 ``extra_args["voxtral_euler_steps"]``, read per
++          request by ``_extract_euler_steps`` in the same class.
++        * ``seed`` -> stage 0 ``extra_args["voxtral_noise_seed"]``, which pins the
++          Gaussian each frame's flow-matching ODE starts from. This mirrors the
++          ``qwen3_tts_request_seed`` line above and exists for the same reason: the
++          plain ``SamplingParams.seed`` set there is arithmetically inert for
++          Voxtral, because stage 0 hands vLLM's sampler a vocab-wide -inf row with a
++          single finite entry (``fake_logits_for_audio_tokens``), so the winning
++          token is forced whatever the sampler decides. The audio is produced beside
++          that path, in ``make_omni_output``.
++        * ``acoustic_temperature`` -> stage 1's sampling temperature, the per-request
++          twin of the server's startup knob. Stage 1 is a deterministic codec
++          decoder, so this is expected to change nothing; it is routed anyway so the
++          claim can be tested without a restart.
++
++        ``extra_params`` stays the lower-level route and WINS on conflict: it is the
++        explicit "put this in extra_args" escape hatch, and silently overriding it
++        from a convenience field would make the escape hatch untrustworthy.
++
++        Note the whole extra_args mechanism is gated on stage 0's deploy YAML
++        ``default_sampling_params.extra_args`` being non-empty: that is what sets
++        ``has_sampling_extra_args`` (``engine/stage_init_utils.py``), and the model
++        runner only builds ``sampling_extra_args`` when it is true. Keep a default
++        ``cfg_alpha`` in the deploy config or none of this reaches the model.
++
++        Parameters
++        ----------
++        request : OpenAICreateSpeechRequest
++            The parsed speech request.
++        sampling_params_list : list[SamplingParams] | None
++            Per-stage sampling params, possibly still the engine's shared default
++            list (copied here before mutation if so).
++
++        Returns
++        -------
++        list[SamplingParams] | None
++            The list to generate with, unchanged when nothing applies.
++        """
++        if self._tts_model_type != "voxtral_tts" or not sampling_params_list:
++            return sampling_params_list
++
++        explicit_extras = request.extra_params or {}
++        # (extra_args key, requested value) pairs; None values mean "not requested".
++        stage0_extras = {
++            "cfg_alpha": getattr(request, "cfg_alpha", None),
++            "voxtral_euler_steps": getattr(request, "euler_steps", None),
++            "voxtral_noise_seed": request.seed,
++        }
++        stage0_extras = {
++            key: value for key, value in stage0_extras.items() if value is not None and key not in explicit_extras
++        }
++        acoustic_temperature = getattr(request, "acoustic_temperature", None)
++        wants_stage1 = acoustic_temperature is not None and len(sampling_params_list) > 1
++        if not stage0_extras and not wants_stage1:
++            return sampling_params_list
++
++        if sampling_params_list is self.engine_client.default_sampling_params_list:
++            import copy
++
++            sampling_params_list = copy.deepcopy(sampling_params_list)
++
++        if stage0_extras:
++            if sampling_params_list[0].extra_args is None:
++                sampling_params_list[0].extra_args = {}
++            sampling_params_list[0].extra_args.update(stage0_extras)
++        if wants_stage1:
++            sampling_params_list[1].temperature = acoustic_temperature
++        logger.info(
++            "Applied Voxtral request overrides: stage0=%s stage1_temperature=%s",
++            stage0_extras,
++            acoustic_temperature if wants_stage1 else None,
++        )
++        return sampling_params_list
++
+     async def _generate_pcm_chunks(self, generator, request_id: str):
+         """Yield raw PCM byte chunks from the engine generator.
+ 

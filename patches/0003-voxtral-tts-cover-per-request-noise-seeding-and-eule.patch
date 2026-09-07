@@ -1,0 +1,180 @@
+From a58ccf8a37b2921d3c242721d978de6ef67d2a96 Mon Sep 17 00:00:00 2001
+From: thiswillbeyourgithub
+ <26625900+thiswillbeyourgithub@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 20:12:57 +0200
+Subject: [PATCH 3/4] voxtral tts: cover per-request noise seeding and euler
+ steps
+
+Pins the three properties the feature exists for: an unseeded batch stays
+bit-for-bit upstream, a seed reproduces its own frame sequence, and a seeded
+row is unaffected by who shares its batch (the property a global-RNG approach
+cannot have). Plus the guards: batch/row mismatch refuses rather than seeding
+the wrong request, and euler_steps needs batch agreement.
+
+The class is instantiated via __new__ + nn.Module.__init__ because the real
+__init__ wants a VllmConfig and the checkpoint, while both methods under test
+only read n_acoustic_codebook.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../test_per_request_noise_and_steps.py       | 151 ++++++++++++++++++
+ 1 file changed, 151 insertions(+)
+ create mode 100644 tests/model_executor/models/voxtral_tts/test_per_request_noise_and_steps.py
+
+diff --git a/tests/model_executor/models/voxtral_tts/test_per_request_noise_and_steps.py b/tests/model_executor/models/voxtral_tts/test_per_request_noise_and_steps.py
+new file mode 100644
+index 0000000..7c8be49
+--- /dev/null
++++ b/tests/model_executor/models/voxtral_tts/test_per_request_noise_and_steps.py
+@@ -0,0 +1,151 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""
++Tests for the per-request noise seed and Euler step count (local fork).
++
++These cover ``VoxtralTTSForConditionalGeneration._make_frame_noise`` and
++``._extract_euler_steps``, the two readers of the extra_args keys that
++``serving_speech.py::_apply_voxtral_request_overrides`` fills from a request's
++``seed`` / ``euler_steps`` fields.
++
++The properties worth pinning down, in the order they matter:
++
++* an unseeded batch must behave exactly like upstream (no noise produced here,
++  the callee draws its own);
++* the same seed must give the same frame sequence, and different seeds must not;
++* a seeded row must not depend on who else is in its batch. That is the whole
++  reason the noise is drawn per row from its own generator rather than by
++  re-pinning the global RNG, which can only give one stream to a whole batch.
++"""
++
++import functools
++
++import pytest
++import torch
++
++pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
++
++N_ACOUSTIC_CODEBOOKS = 36
++HIDDEN_DIM = 8
++
++
++@functools.lru_cache(maxsize=1)
++def _voxtral_tts_class():
++    # Same import dance as test_audio_tokenizer_parsing.py: pin vLLM's layer
++    # custom-op modules first so ``direct_register_custom_op`` does not run twice.
++    from tests.model_executor.helpers import bootstrap_vllm_layer_custom_op_modules
++
++    bootstrap_vllm_layer_custom_op_modules()
++    import vllm.model_executor.models.utils  # noqa: F401
++
++    from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts import (
++        VoxtralTTSForConditionalGeneration,
++    )
++
++    return VoxtralTTSForConditionalGeneration
++
++
++def _make_model():
++    """Build an instance without running the real ``__init__``.
++
++    The real one needs a VllmConfig and the ~9GB checkpoint; the two methods
++    under test only read ``self.model.acoustic_transformer.model_args`` and the
++    class-level extra_args key names.
++    """
++    from types import SimpleNamespace
++
++    cls = _voxtral_tts_class()
++    model = cls.__new__(cls)
++    torch.nn.Module.__init__(model)
++    model.model = SimpleNamespace(
++        acoustic_transformer=SimpleNamespace(model_args=SimpleNamespace(n_acoustic_codebook=N_ACOUSTIC_CODEBOOKS))
++    )
++    return model
++
++
++def _hidden(batch_size: int) -> torch.Tensor:
++    return torch.zeros(batch_size, HIDDEN_DIM, dtype=torch.float32)
++
++
++def _frames(model, rows, n_frames: int, batch_size: int | None = None):
++    """Collect ``n_frames`` consecutive noise tensors for one batch composition."""
++    hidden = _hidden(batch_size if batch_size is not None else len(rows))
++    return [model._make_frame_noise(hidden, rows) for _ in range(n_frames)]
++
++
++def test_no_seed_means_no_noise():
++    model = _make_model()
++    assert model._make_frame_noise(_hidden(1), None) is None
++    assert model._make_frame_noise(_hidden(1), []) is None
++    assert model._make_frame_noise(_hidden(2), [{"cfg_alpha": 1.3}, {}]) is None
++
++
++def test_noise_shape_and_dtype_follow_hidden_states():
++    model = _make_model()
++    hidden = torch.zeros(2, HIDDEN_DIM, dtype=torch.float64)
++    noise = model._make_frame_noise(hidden, [{"voxtral_noise_seed": 1}, {}])
++    assert noise.shape == (2, N_ACOUSTIC_CODEBOOKS)
++    assert noise.dtype == torch.float64
++
++
++def test_same_seed_reproduces_the_frame_sequence():
++    model = _make_model()
++    first = _frames(model, [{"voxtral_noise_seed": 7}], n_frames=3)
++    # Fresh rows: a request's frame counter lives in its own extra_args dict.
++    second = _frames(model, [{"voxtral_noise_seed": 7}], n_frames=3)
++    for a, b in zip(first, second):
++        assert torch.equal(a, b)
++    # Consecutive frames of one take must differ, or every frame would start
++    # from the same noise and the audio would be degenerate.
++    assert not torch.equal(first[0], first[1])
++
++
++def test_different_seeds_diverge():
++    model = _make_model()
++    a = _frames(model, [{"voxtral_noise_seed": 7}], n_frames=1)[0]
++    b = _frames(model, [{"voxtral_noise_seed": 8}], n_frames=1)[0]
++    assert not torch.equal(a, b)
++
++
++def test_seeded_row_is_independent_of_its_batchmates():
++    model = _make_model()
++    alone = _frames(model, [{"voxtral_noise_seed": 42}], n_frames=2)
++    # Same request, now sharing the step with an unseeded one in slot 0.
++    shared_rows = [{}, {"voxtral_noise_seed": 42}]
++    shared = _frames(model, shared_rows, n_frames=2)
++    for solo, batched in zip(alone, shared):
++        assert torch.equal(solo[0], batched[1])
++
++
++def test_frame_counter_is_stored_on_the_request_row():
++    model = _make_model()
++    rows = [{"voxtral_noise_seed": 3}]
++    _frames(model, rows, n_frames=4)
++    assert rows[0]["_voxtral_noise_step"] == 4
++
++
++def test_batch_size_mismatch_is_refused_not_misapplied():
++    model = _make_model()
++    # Two rows, one hidden-state row: applying row 1's seed would seed the wrong
++    # request, so no noise is produced at all.
++    assert model._make_frame_noise(_hidden(1), [{"voxtral_noise_seed": 1}, {}]) is None
++
++
++def test_euler_steps_needs_batch_agreement():
++    model = _make_model()
++    assert model._extract_euler_steps(None) is None
++    assert model._extract_euler_steps([{}, {"cfg_alpha": 1.3}]) is None
++    assert model._extract_euler_steps([{"voxtral_euler_steps": 12}]) == 12
++    assert model._extract_euler_steps([{"voxtral_euler_steps": 12}, {"voxtral_euler_steps": 12}]) == 12
++    # Disagreement falls back to the model default rather than picking a winner.
++    assert model._extract_euler_steps([{"voxtral_euler_steps": 12}, {"voxtral_euler_steps": 4}]) is None
++
++
++@pytest.mark.parametrize("seed", [0, 1, 2**63 - 1, 2**64 - 1])
++def test_seed_range_is_accepted(seed):
++    # torch.Generator.manual_seed rejects anything outside
++    # [-2**63, 2**64-1], and the request schema allows up to 2**63-1; the mixer
++    # must keep the derived stream seed inside that window for any input.
++    model = _make_model()
++    noise = model._make_frame_noise(_hidden(1), [{"voxtral_noise_seed": seed}])
++    assert torch.isfinite(noise).all()

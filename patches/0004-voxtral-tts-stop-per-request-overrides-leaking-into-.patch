@@ -1,0 +1,95 @@
+From 75c62edf38cd24a139397b6f1a83117ec4adf6f0 Mon Sep 17 00:00:00 2001
+From: thiswillbeyourgithub
+ <26625900+thiswillbeyourgithub@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 21:11:56 +0200
+Subject: [PATCH 4/4] voxtral tts: stop per-request overrides leaking into the
+ engine defaults
+
+The `is default_sampling_params_list` guard the seed block used (and that the
+new override routing copied) never matches: _prepare_speech_generation builds
+the list with list(), a shallow copy, and coerce_param_message_types returns
+the same SamplingParams objects when the output kind already matches. So the
+list is never `is` the default while its elements usually are, and the guard
+reads "already private" while letting the mutation through to shared state,
+where this request's seed, cfg_alpha and euler_steps would become the default
+for every later request in the process.
+
+Both sites now go through _own_sampling_params, which deep-copies
+unconditionally. That copy is also what gives the model a private extra_args
+dict to keep each request's frame counter in, without which two concurrent
+seeded requests would share one counter.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ .../entrypoints/openai/serving_speech.py      | 44 +++++++++++++++----
+ 1 file changed, 36 insertions(+), 8 deletions(-)
+
+diff --git a/vllm_omni/entrypoints/openai/serving_speech.py b/vllm_omni/entrypoints/openai/serving_speech.py
+index cadaf96..a12c0d9 100644
+--- a/vllm_omni/entrypoints/openai/serving_speech.py
++++ b/vllm_omni/entrypoints/openai/serving_speech.py
+@@ -3034,10 +3034,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
+                 )
+ 
+         if request.seed is not None and sampling_params_list:
+-            if sampling_params_list is self.engine_client.default_sampling_params_list:
+-                import copy
+-
+-                sampling_params_list = copy.deepcopy(sampling_params_list)
++            # Was guarded by `is default_sampling_params_list`, which never matches:
++            # see _own_sampling_params for why that check cannot work, and what a
++            # missed copy leaks into every later request.
++            sampling_params_list = self._own_sampling_params(sampling_params_list)
+             sampling_params_list[0].seed = request.seed
+             if self._tts_model_type == "qwen3_tts":
+                 if sampling_params_list[0].extra_args is None:
+@@ -3055,6 +3055,37 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
+         self._track_ref_audio_artifact_warmup(request_id, qwen3_ref_audio_warmup_artifact_key)
+         return request_id, generator, tts_params
+ 
++    @staticmethod
++    def _own_sampling_params(sampling_params_list):
++        """Return a copy this request may safely mutate.
++
++        Local fork. The tempting guard, ``if sampling_params_list is
++        self.engine_client.default_sampling_params_list``, cannot work:
++        ``_prepare_speech_generation`` builds the list with ``list(...)``, a SHALLOW
++        copy, and ``coerce_param_message_types`` hands back the same SamplingParams
++        objects whenever the output kind already matches. The list is therefore never
++        ``is`` the default while its elements usually are, so that check reads as
++        "already private" and lets a mutation through to the shared objects, where it
++        becomes the default for every later request in the process.
++
++        The copy also gives the model a private ``extra_args`` dict, which is what
++        lets it keep a per-request frame counter beside the noise seed.
++
++        Parameters
++        ----------
++        sampling_params_list : list[SamplingParams]
++            Per-stage sampling params, possibly sharing objects with the engine
++            defaults.
++
++        Returns
++        -------
++        list[SamplingParams]
++            A deep copy, safe to mutate.
++        """
++        import copy
++
++        return copy.deepcopy(sampling_params_list)
++
+     def _apply_voxtral_request_overrides(self, request, sampling_params_list):
+         """Route Voxtral TTS's flat request fields to where the model reads them.
+ 
+@@ -3120,10 +3151,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
+         if not stage0_extras and not wants_stage1:
+             return sampling_params_list
+ 
+-        if sampling_params_list is self.engine_client.default_sampling_params_list:
+-            import copy
+-
+-            sampling_params_list = copy.deepcopy(sampling_params_list)
++        sampling_params_list = self._own_sampling_params(sampling_params_list)
+ 
+         if stage0_extras:
+             if sampling_params_list[0].extra_args is None:

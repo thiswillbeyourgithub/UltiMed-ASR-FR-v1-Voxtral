@@ -1,0 +1,24 @@
+# Build context = this directory (see the voxtral-tts service in
+# docker-compose.yml), and the vllm-omni clone inside it makes that context big
+# enough to matter: every `docker build` tars and ships the whole thing to the
+# daemon before the first instruction runs.
+#
+# Only two things are actually COPY'd: entrypoint.sh and vllm-omni/ (the package
+# source). Everything below is either weight, noise, or a rebuild trigger we do
+# not want, since a changed file invalidates the cached COPY layer even when the
+# Dockerfile never reads it.
+
+# ~21MB of git objects; the install uses VLLM_OMNI_VERSION_OVERRIDE precisely so
+# no git metadata is needed at build time.
+vllm-omni/.git
+vllm-omni/**/__pycache__
+vllm-omni/.pytest_cache
+
+# Test/recording output and local tooling, none of it part of the image.
+audios
+__pycache__
+.claude
+patches
+install.sh
+env.reference
+test_seed_determinism.sh

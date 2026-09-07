@@ -1,0 +1,146 @@
+services:
+  # Voxtral TTS (text -> audio) served by vLLM + vllm-omni. Model:
+  # mistralai/Voxtral-4B-TTS-2603. This is the container that spoke every clip of
+  # the UltiMed-ASR-FR-v1 dataset; see README.md for the provenance.
+  #
+  # The image is built from ./Dockerfile on top of the official
+  # vllm/vllm-omni:v0.22.0-x86_64 image, plus flash-attn, plus vllm_omni
+  # reinstalled from ./vllm-omni, a local clone of upstream at the same tag whose
+  # `perso` branch adds the per-request cfg_alpha / seed / euler_steps routing.
+  # That clone is gitignored: on a fresh checkout, recreate it from patches/
+  # BEFORE the first --build, see the README there.
+  #
+  # Client: ./tts.py, e.g.
+  #   ./tts.py -t "Bonjour." --voice fr_female -o out.wav
+  # It POSTs to :8003/v1/audio/speech, same as any OpenAI TTS client.
+  #
+  # Start it with:  sudo docker compose up -d --build voxtral-tts
+  voxtral-tts:
+    container_name: voxtral-tts
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Bake a passwd entry for the runtime uid/gid so vLLM's getpass.getuser()
+      # lookup does not crash ("getpwuid(): uid not found"). Keep these in sync
+      # with the `user:` line below.
+      args:
+        APP_UID: ${VOXTRAL_UID:-1000}
+        APP_GID: ${VOXTRAL_GID:-1000}
+    image: voxtral-tts-local:0.22.0
+    ports:
+      - "8003:8003"
+    # Run as the host user (matches the crispasr services) and keep every cache
+    # under the mounted ./cache so downloaded weights (~9GB) survive restarts and
+    # stay host-visible/host-owned instead of landing in a root-owned /root.
+    user: "${VOXTRAL_UID:-1000}:${VOXTRAL_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./cache:/cache
+    environment:
+      - HOME=/cache
+      - HF_HOME=/cache/huggingface
+      - XDG_CACHE_HOME=/cache
+      # If the model repo is gated on Hugging Face, pass a token:
+      # - HF_TOKEN=TODO
+      # entrypoint.sh reads the tuning vars below at boot and patches them into a
+      # copy of the bundled deploy YAML, handed to `vllm serve --omni` via
+      # --deploy-config (VLLM_EXTRA_ARGS goes to the serve command instead).
+      # Changing any value needs no rebuild, just `up -d`. See the Voxtral TTS
+      # section in README.md for the two-stage story.
+      # Acoustic-decoder (stage 1) sampling temperature (entrypoint default is 0.7,
+      # lowered from upstream 0.9 for steadier audio; raise toward 0.9 for more expressive):
+      # - VOXTRAL_ACOUSTIC_TEMP=0.7
+      # vLLM ENGINE seed for both stages (not a sampling param: the sampling seed is
+      # inert here, see the entrypoint's note). It seeds the global RNG that the one
+      # random draw in the pipeline comes from, the Gaussian each frame's
+      # flow-matching ODE starts from, and it now governs only the requests that
+      # carry NO seed of their own: this image runs our patched vllm_omni, where a
+      # seeded request draws from its own generator instead
+      # (`tts.py --noise-seed 7` returns identical audio at any point in the
+      # container's life, no restart, no toggle). vLLM already defaults this to 0,
+      # so changing it just picks a different stream for the unseeded case:
+      # - VOXTRAL_SEED=42
+      # Bitwise determinism escape hatch, read by vLLM itself (not the entrypoint).
+      # Forces batch-invariant kernels so results stop depending on how requests get
+      # batched together. Costs throughput; only worth it when chasing a numerical
+      # diff. See vllm/model_executor/layers/batch_invariant.py:
+      # - VLLM_BATCH_INVARIANT=1
+      # Per-stage max concurrent sequences (packaged 32). NOTE: the acoustic stage
+      # is codec-bs=1, so audio throughput saturates around client concurrency 4-8;
+      # raising this past that buys little. (The 0.18 runtime.defaults.max_inflight
+      # lever no longer exists in the 0.22 schema.)
+      # - VOXTRAL_MAX_NUM_SEQS=32
+      # Euler ODE steps for the stage-0 flow-matching acoustic transformer: the main
+      # compute<->quality lever. More steps = steadier/higher-fidelity audio for
+      # more compute; fewer = faster. vllm-omni reads this only from the model's
+      # params.json (not this YAML), so entrypoint.sh patches it in. Unset =
+      # vllm-omni default of 7 (raise toward 8-16 for quality, drop to 3-4 for speed).
+      # Only the DEFAULT: `tts.py --euler-steps N` overrides it per request (which
+      # drops that request to the eager path, since the CUDA graphs are captured at
+      # one fixed step count), so sweep without restarting:
+      - VOXTRAL_EULER_STEPS=16
+      # Stage-0 classifier-free guidance scale. Higher = the decoder sticks more
+      # tightly to the text at the cost of naturalness/expressivity. Guide:
+      #   1.0        = CFG OFF -> garbled/off-text audio; REFUSED by entrypoint.
+      #   1.2        = paper/default, the recommended setting.
+      #   ~1.3-1.7   = stronger text adherence; may sound flatter/harsher.
+      #   >~2.0      = over-guided, tends to introduce artifacts/distortion.
+      # Only the default (`tts.py --cfg-alpha` overrides it per request), but do NOT
+      # comment it out: stage 0's default_sampling_params.extra_args must be
+      # non-empty or vllm-omni sets has_sampling_extra_args=False and drops every
+      # per-request extra, the noise seed and euler steps included.
+      # - VOXTRAL_CFG_ALPHA=1.2
+      - VOXTRAL_CFG_ALPHA=1.3
+      # Stage-0 GPU memory fraction (packaged 0.8). Stage 0 (0.8) + stage 1 (0.1)
+      # + CUDA contexts + desktop usage overflow a 24GB card shared with a display
+      # (stage 1 then fails with "Free memory ... less than desired GPU memory
+      # utilization"). Lower stage 0 to ~0.7 to make both stages fit:
+      - VOXTRAL_GPU_MEM_UTIL=0.7
+      # Longest utterance ONE request can produce. Stage 0 emits exactly one
+      # 12.5 Hz audio frame per decode step, so the packaged max_tokens of 2048
+      # means 163.84 s; past that the audio is cut off mid-sentence with
+      # finish_reason "length" and no error. 12.5 frames = 1 second, so
+      # seconds x 12.5 = the value to set (4096 = 327.68 s, 7500 = 600 s). 4096 is
+      # also the ceiling tts.py --max-new-tokens can ask for per request
+      # (vllm-omni's _TTS_MAX_NEW_TOKENS_MAX), so setting it here means the two
+      # agree and no request can be silently truncated below it:
+      # - VOXTRAL_MAX_TOKENS=2048
+      - VOXTRAL_MAX_TOKENS=4096
+      # Stage-0 context (packaged 4096). Prompt text tokens and generated frames
+      # SHARE it, so this is the real ceiling and VOXTRAL_MAX_TOKENS above is
+      # unreachable beyond it. Not a model limit (the checkpoint's params.json
+      # says max_seq_len 65536), but every token of context costs ~104 KiB of KV
+      # cache, so raising it trades concurrency for length inside the same
+      # VOXTRAL_GPU_MEM_UTIL pool. Keep it above VOXTRAL_MAX_TOKENS + the prompt:
+      # leaving it at the packaged 4096 with max_tokens=4096 would mean the 4096th
+      # frame is never reached, since the text tokens are spent from the same 4096.
+      # 6144 = 4096 frames + ~2048 tokens of prompt room, which covers the ~1200-1600
+      # French tokens it takes to ask for 327 s of speech; the entrypoint warns if
+      # this ever drops back to or below max_tokens. ~640 MiB of KV cache for one
+      # full-length request, against a pool of several GB at GPU_MEM_UTIL=0.7:
+      # - VOXTRAL_MAX_MODEL_LEN=4096
+      - VOXTRAL_MAX_MODEL_LEN=6144
+      # Extra `vllm serve` flags, space-separated (opt-in; do not quote-wrap).
+      # NOTE: --max-model-len is NOT the lever here, the per-stage YAML field is
+      # (use VOXTRAL_MAX_MODEL_LEN above):
+      # - VLLM_EXTRA_ARGS=--enable-log-requests
+    # vLLM needs a large /dev/shm for its tensor/NCCL buffers.
+    shm_size: "8gb"
+    healthcheck:
+      # vLLM exposes /health; use python3 (curl may be absent in the vllm image).
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health')\" >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # First boot downloads ~9GB of weights, so allow a long warmup.
+      start_period: 300s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${VOXTRAL_GPU_COUNT:-all}
+              capabilities: [gpu]
+    restart: unless-stopped
+
