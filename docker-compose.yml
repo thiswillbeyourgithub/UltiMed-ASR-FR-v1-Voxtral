@@ -29,7 +29,7 @@ services:
     image: voxtral-tts-local:0.22.0
     ports:
       - "8003:8003"
-    # Run as the host user (matches the crispasr services) and keep every cache
+    # Run as the host user and keep every cache
     # under the mounted ./cache so downloaded weights (~9GB) survive restarts and
     # stay host-visible/host-owned instead of landing in a root-owned /root.
     user: "${VOXTRAL_UID:-1000}:${VOXTRAL_GID:-1000}"
@@ -46,8 +46,12 @@ services:
       # entrypoint.sh reads the tuning vars below at boot and patches them into a
       # copy of the bundled deploy YAML, handed to `vllm serve --omni` via
       # --deploy-config (VLLM_EXTRA_ARGS goes to the serve command instead).
-      # Changing any value needs no rebuild, just `up -d`. See the Voxtral TTS
-      # section in README.md for the two-stage story.
+      # Changing any value needs no rebuild, just `up -d`. See the "Seeding and
+      # reproducibility" section in README.md for the two-stage story.
+      # Which model to serve, and on which port inside the container. Both have
+      # entrypoint defaults; changing the port also means changing `ports:` above:
+      # - VOXTRAL_TTS_MODEL=mistralai/Voxtral-4B-TTS-2603
+      # - VOXTRAL_TTS_PORT=8003
       # Acoustic-decoder (stage 1) sampling temperature (entrypoint default is 0.7,
       # lowered from upstream 0.9 for steadier audio; raise toward 0.9 for more expressive):
       # - VOXTRAL_ACOUSTIC_TEMP=0.7
