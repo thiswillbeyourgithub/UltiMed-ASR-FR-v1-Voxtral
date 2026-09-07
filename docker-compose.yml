@@ -41,8 +41,6 @@ services:
       - HOME=/cache
       - HF_HOME=/cache/huggingface
       - XDG_CACHE_HOME=/cache
-      # If the model repo is gated on Hugging Face, pass a token:
-      # - HF_TOKEN=TODO
       # entrypoint.sh reads the tuning vars below at boot and patches them into a
       # copy of the bundled deploy YAML, handed to `vllm serve --omni` via
       # --deploy-config (VLLM_EXTRA_ARGS goes to the serve command instead).
