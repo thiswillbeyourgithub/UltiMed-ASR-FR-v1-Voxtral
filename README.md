@@ -1,5 +1,16 @@
 # UltiMed-ASR-FR-v1-Voxtral
 
+> [!WARNING]
+> **This documentation was written by an AI agent (Claude Code) and very likely contains some
+> degree of hallucination.** Treat it as a guided tour, not as a specification: the code, the
+> configs and the commit history are the source of truth, and where they disagree with a
+> sentence below, they win.
+>
+> It is written this way on purpose. I published this to be useful to other people, and I cannot
+> afford the time to document all of it properly by hand. The expected way to onboard is to point
+> an LLM at the repository and have it check every claim against the actual files, which is also
+> how it was written. If you find something wrong, an issue is welcome.
+
 The Docker container that spoke **[UltiMed-ASR-FR-v1](https://huggingface.co/datasets/Olicorne/UltiMed-ASR-FR-v1)**: `mistralai/Voxtral-4B-TTS-2603` served by vLLM + [vllm-omni](https://github.com/vllm-project/vllm-omni), on one consumer GPU, behind an OpenAI-compatible `POST /v1/audio/speech` on port 8003.
 
 Written with Claude Code.
